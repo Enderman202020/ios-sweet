@@ -1,5 +1,47 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## >>> UPDATE 2026-11-20 00:36: GPU разбит на две части, GX уходит в ядро <<<
+
+**Готово и проверено на железе (шим, `fastboot boot build/ios/gpuprobe.img`):**
+
+| Этап | Состояние |
+|---|---|
+| SMMU: page tables, контекст, поток 5 | работает, `fsr=0` |
+| GMU: прошивка, `BABEFACE` | работает |
+| HFI: очереди + 4 сообщения | все приняты (`INIT`, `FW_VERSION`, `PERF_TABLE`, `BW_TABLE`) |
+| cmd-db: чтение уровней рельсов | работает, `gfx_ascend=1` |
+
+**Не работает и не может работать из шима:** питание домена GX.
+`GPUCC_GX_GDSCR` = `0x02220001` (bit0 `SW_COLLAPSE`=1, bit31 `POWER_ON`=0).
+Снятие `SW_COLLAPSE` даёт `0x02220000`, но `POWER_ON` не встаёт: нужен голос
+на рельс `gfx.lvl` через RPMh, а TCS-регистры RSC принадлежат `sweet_rpmh.c`
+в ядре. Любая запись в GX-регистр при тёмном домене сбрасывает прошивку —
+проверено трижды с тремя разными порядками.
+
+**Поэтому патч 0083** (`vendor/ios-sweet/xnu/patches/0083-sweet-gpu-gx-rail.patch`,
+431 строка, коммит `2b0cbd6`, запушен в `Enderman202020/ios-sweet`):
+
+- новый `bsd/dev/sweet_gpu.c` (170 строк) — только питание GX
+- `sweet_rpmh.c`: `rh_send` → обобщённый `rh_tcs_run`, плюс
+  `sweet_rpmh_gpu_rail_vote()` и `rh_lookup_slave()`
+- `sweet_ufs.c`: вызов `sweet_gpu_init()` после монтирования
+- `conf/files`: одна строка
+
+Включается **только** с `sweetgpu=1`, уровень — `sweetgpulvl` (по умолчанию 192).
+
+**CI:** run `44579081505`.  Прошлый run (`0082`) упал не из-за кода: раннер
+macOS не выделился («the job was not acquired by Runner of type hosted»).
+Если увидишь эту подпись — это rerun, а не отладка.
+
+**Следующий шаг:** загрузить ядро с `sweetgpu=1`, читать строки `SWEET GPU:`.
+`POWER_ON` встал → домен жив впервые, и остальные шаги шима (SPTPRAC,
+CORE_REQUEST, кольцо) можно переносить.  «the rail vote landed but the domain
+did not come up» → уровень неверен или голос не дошёл; смотреть TCS-строки.
+
+**Ловушка:** первый патч вышел на 3853 строки из-за `core.autocrlf=true` —
+git считал изменённым весь `bsd/conf/files`.  С `core.eol=lf` и
+нормализованными файлами — 431 строка.  Проверять размер патча перед пушем.
+
 ## Agent handoff / active work (2026-10-15, latest)
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
