@@ -1,0 +1,431 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6630131..7d7f355 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -105,6 +105,7 @@ bsd/dev/random/randomdev.c		standard
+ 
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
++bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+new file mode 100644
+index 0000000..22ca799
+--- /dev/null
++++ b/bsd/dev/sweet_gpu.c
+@@ -0,0 +1,170 @@
++/*
++ * sweet_gpu.c - power the GPU's GX domain, which is what a probe could not do.
++ *
++ * WHY ONLY THIS
++ *
++ * Four of the five GPU bring-up steps are already proven on this phone by the
++ * shim probes booted with `fastboot boot`: the SMMU context with real page
++ * tables, the GMU firmware running (`0xbabeface`), the HFI queues and the whole
++ * four-message handshake.  None of that needs to move yet.
++ *
++ * The fifth did not work there, and cannot: the GX domain stays off because
++ * `GPUCC_GX_GDSCR` reads `0x02220001` -- SW_COLLAPSE set, POWER_ON clear -- and
++ * clearing SW_COLLAPSE alone gives `0x02220000` with POWER_ON still clear.  The
++ * domain needs its supply rail `gfx.lvl` voted up through RPMh, and RPMh votes
++ * need the RSC's TCS registers, which sweet_rpmh.c already owns.  That is the
++ * one thing a fastboot image cannot do and a kernel driver can.
++ *
++ * So this file does one job and reports everything it sees:
++ *
++ *     1. vote gfx.lvl up through sweet_rpmh.c      (the new part)
++ *     2. clear SW_COLLAPSE on the GX GDSC
++ *     3. read back whether POWER_ON came up
++ *
++ * If step 3 succeeds, the shim's remaining work (SPTPRAC, CORE_REQUEST, the
++ * command ring) can follow, and the probe image can go back to being the place
++ * where register sequences are tried.
++ *
++ * WHAT IS GUESSED AND WHAT IS NOT
++ *
++ * Not guessed: the register offsets, the bit meanings, the absence of IPS from
++ * TCR, the queue layout -- all measured.  Not guessed: that the vote has to
++ * happen, because two runs showed POWER_ON refusing to rise without it.
++ *
++ * Guessed: the *level* to vote for.  The shim read the rail's corner list out
++ * of cmd-db and the top corner was 192, so that is what is asked for; the boot
++ * argument `sweetgpulvl` overrides it, and the log prints what the rail held
++ * before and after so the next run can correct it from evidence.
++ *
++ * BOOT ARGUMENT
++ *
++ *     sweetgpu=1        attempt it at all (default off: this must not be able
++ *                       to break a normal boot)
++ *     sweetgpulvl=<n>   the level to vote for (default 192)
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern int sweet_rpmh_gpu_rail_vote(const char *res, uint32_t level);
++
++#define GPUCC_BASE	0x05090000UL
++#define GPUCC_GX_GDSCR	0x100c
++
++#define GDSC_SW_COLLAPSE	(1u << 0)
++#define GDSC_POWER_ON		(1u << 31)
++
++static vm_offset_t gpucc;
++
++static uint32_t
++gpucc_rd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(gpucc + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++gpucc_wr(uint32_t off, uint32_t v)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(gpucc + off) = v;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++/*
++ * Turn the GX domain on.  Returns 0 when POWER_ON is set afterwards.
++ *
++ * The order is: vote the rail, then release the switch, then wait.  Releasing
++ * the switch first was tried from the shim and produced 0x02220000 with the
++ * domain still dark, so the vote has to come first.
++ */
++int
++sweet_gpu_gx_power_on(uint32_t level)
++{
++	uint32_t before, after;
++	int error;
++
++	if (!gpucc) {
++		gpucc = ml_io_map(GPUCC_BASE, 0x10000);
++		if (!gpucc) {
++			printf("SWEET GPU: GPUCC did not map\n");
++			return ENOMEM;
++		}
++	}
++
++	before = gpucc_rd(GPUCC_GX_GDSCR);
++	printf("SWEET GPU: GX GDSCR before: %#x (power_on=%u sw_collapse=%u)\n",
++	    before, (before >> 31) & 1, before & 1);
++
++	if (before & GDSC_POWER_ON) {
++		printf("SWEET GPU: GX was already on; nothing to do\n");
++		return 0;
++	}
++
++	/*
++	 * The vote.  This is the step the probe images could not take: the TCS
++	 * registers belong to sweet_rpmh.c.
++	 */
++	printf("SWEET GPU: voting gfx.lvl = %u\n", level);
++	error = sweet_rpmh_gpu_rail_vote("gfx.lvl", level);
++	if (error) {
++		printf("SWEET GPU: the rail vote failed (%d); GX will stay off\n", error);
++		return error;
++	}
++
++	/* Let the rail settle before asking the domain to use it. */
++	delay(10);
++
++	gpucc_wr(GPUCC_GX_GDSCR, before & ~GDSC_SW_COLLAPSE);
++	for (int i = 0; i < 500; i++) {
++		after = gpucc_rd(GPUCC_GX_GDSCR);
++		if (after & GDSC_POWER_ON)
++			break;
++		delay(1);
++	}
++	after = gpucc_rd(GPUCC_GX_GDSCR);
++	printf("SWEET GPU: GX GDSCR after: %#x (power_on=%u sw_collapse=%u)\n",
++	    after, (after >> 31) & 1, after & 1);
++
++	if (!(after & GDSC_POWER_ON)) {
++		printf("SWEET GPU: the rail vote landed but the domain did not come up\n");
++		return ENODEV;
++	}
++
++	printf("SWEET GPU: GX IS POWERED\n");
++	return 0;
++}
++
++/*
++ * Called once from sweet_ufs.c after the root is mounted, which is late enough
++ * that the RPMh client has been used successfully for L11C and early enough to
++ * be before anything wants the GPU.
++ *
++ * Off unless `sweetgpu=1`.  A bring-up step that can reset the GPU's rail has
++ * no business running on a normal boot.
++ */
++void
++sweet_gpu_init(void)
++{
++	int enabled = 0;
++	uint32_t level = 192;
++
++	(void)PE_parse_boot_argn("sweetgpu", &enabled, sizeof(enabled));
++	if (!enabled)
++		return;
++	(void)PE_parse_boot_argn("sweetgpulvl", &level, sizeof(level));
++
++	printf("SWEET GPU: starting (level %u)\n", level);
++	if (sweet_gpu_gx_power_on(level) == 0) {
++		printf("SWEET GPU: done; the shim's remaining steps can follow\n");
++	} else {
++		printf("SWEET GPU: gave up; see the lines above\n");
++	}
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 4da50d8..e0b7dd2 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -160,6 +160,25 @@ rh_map(void)
+ 
+ static int
+ rh_lookup(const char *res, uint32_t *address)
++{
++	/*
++	 * Voltage regulators are the VRM slave, and their entries carry the
++	 * slave number in the top half of the address as a sanity check.  The
++	 * shared walker does that; this is the name the callers use.
++	 */
++	static int rh_lookup_slave(const char *, unsigned, uint32_t *);
++
++	return rh_lookup_slave(res, RH_VRM, address);
++}
++
++/*
++ * A level resource (gfx.lvl, mx.lvl, cx.lvl) lives in a different cmd-db slave
++ * from the voltage regulators: ARC is slave 3, the VRM that ldoc11 belongs to is
++ * slave 4.  The validation is the same shape, with the slave number as the
++ * parameter rather than a constant.
++ */
++static int
++rh_lookup_slave(const char *res, unsigned want_slave, uint32_t *address)
+ {
+ 	uint32_t key[2] = {0, 0};
+ 	for (unsigned i = 0; i < 8 && res[i]; ++i) {
+@@ -172,11 +191,14 @@ rh_lookup(const char *res, uint32_t *address)
+ 		if (!slave) {
+ 			break;
+ 		}
++		if (slave != want_slave) {
++			continue;
++		}
+ 		uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
+ 		uint32_t aux = RH_DB_HEADER + rh_db16(h + 4);
+ 		unsigned count = rh_db16(h + 6);
+-		if (slave < 3 || slave > 5 || (entries & 3u) ||
+-		    !rh_range(entries, count * RH_DB_ENTRY) || !rh_range(aux, 0)) {
++		if ((entries & 3u) || !rh_range(entries, count * RH_DB_ENTRY) ||
++		    !rh_range(aux, 0)) {
+ 			printf("SWEET RPMH: malformed cmd-db slave header %u\n", i);
+ 			return EINVAL;
+ 		}
+@@ -186,25 +208,34 @@ rh_lookup(const char *res, uint32_t *address)
+ 				continue;
+ 			}
+ 			uint32_t addr = rh_read(rh_db, e + 16);
+-			if (slave != RH_VRM || (addr >> 16) != RH_VRM || (addr & 15u) ||
++			if ((addr >> 16) != want_slave || (addr & 15u) ||
+ 			    !rh_range(aux + rh_db16(e + 22), rh_db16(e + 20))) {
+-				printf("SWEET RPMH: invalid VRM entry for %s\n", res);
++				printf("SWEET RPMH: %s: entry is not a slave %u resource (addr %#x)\n",
++				    res, want_slave, addr);
+ 				return EINVAL;
+ 			}
+ 			*address = addr;
+ 			++matches;
+-			printf("SWEET RPMH: %s addr=%#x slave=%u aux-version=%#x priority=%#x:%#x\n",
+-			    res, addr, slave, rh_db16(h + 8),
+-			    rh_read(rh_db, e + 8), rh_read(rh_db, e + 12));
++			printf("SWEET RPMH: %s addr=%#x slave=%u length=%u\n",
++			    res, addr, slave, rh_db16(e + 20));
+ 		}
+ 	}
+ 	if (matches != 1) {
+-		printf("SWEET RPMH: %s lookup matches=%u; refusing\n", res, matches);
++		printf("SWEET RPMH: %s lookup matches=%u on slave %u; refusing\n",
++		    res, matches, want_slave);
+ 		return ENODEV;
+ 	}
+ 	return 0;
+ }
+ 
++#define RH_SLAVE_ARC	3u
++
++static int
++rh_lookup_level(const char *res, uint32_t *address)
++{
++	return rh_lookup_slave(res, RH_SLAVE_ARC, address);
++}
++
+ static bool
+ rh_free(unsigned t)
+ {
+@@ -219,7 +250,8 @@ rh_free(unsigned t)
+ }
+ 
+ static int
+-rh_send(uint32_t address, unsigned mv)
++rh_tcs_run(uint32_t address, const uint32_t *offsets, const uint32_t *values,
++    unsigned count, const char *what)
+ {
+ 	int chosen = -1;
+ 	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
+@@ -234,7 +266,8 @@ rh_send(uint32_t address, unsigned mv)
+ 		for (unsigned c = 0; c < rh_ncpt; ++c) {
+ 			if ((enabled & (1u << c)) &&
+ 			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == address) {
+-				printf("SWEET RPMH: conflicting inherited L11C request in TCS%u\n", t);
++				printf("SWEET RPMH: conflicting inherited request for %s in TCS%u\n",
++				    what, t);
+ 				return EBUSY;
+ 			}
+ 		}
+@@ -266,11 +299,9 @@ rh_send(uint32_t address, unsigned mv)
+ 	}
+ 	/* From here an uncertain write/timeout quarantines our slot for this boot. */
+ 	rh_poisoned = true;
+-	/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
+-	const uint32_t offsets[3] = {0, 8, 4};
+-	const uint32_t values[3] = {mv, 7, 1};
+-	printf("SWEET RPMH: TCS%u ACTIVE %u mV mode=7 enable=1 irq-enable=%#x\n", t, mv, irq_en);
+-	for (unsigned c = 0; c < 3; ++c) {
++	printf("SWEET RPMH: TCS%u %s: %u command(s), irq-enable=%#x\n",
++	    t, what, count, irq_en);
++	for (unsigned c = 0; c < count; ++c) {
+ 		uint32_t cmd = b + c * RH_CMD_STRIDE;
+ 		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
+ 		    !rh_sync(cmd + RH_ADDR, address + offsets[c]) ||
+@@ -278,7 +309,8 @@ rh_send(uint32_t address, unsigned mv)
+ 			return EIO;
+ 		}
+ 	}
+-	if (!rh_sync(b + RH_WAIT, 7) || !rh_sync(b + RH_ENABLE, 7) ||
++	if (!rh_sync(b + RH_WAIT, (1u << count) - 1u) ||
++	    !rh_sync(b + RH_ENABLE, (1u << count) - 1u) ||
+ 	    !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
+ 		return EIO;
+ 	}
+@@ -289,7 +321,7 @@ rh_send(uint32_t address, unsigned mv)
+ 		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
+ 		idle = rh_read(rh_tcs, b + RH_STATUS);
+ 		bool complete = true;
+-		for (unsigned c = 0; c < 3; ++c) {
++		for (unsigned c = 0; c < count; ++c) {
+ 			status[c] = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
+ 			complete &= status[c] != 0xffffffffu &&
+ 			    (status[c] & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
+@@ -303,8 +335,9 @@ rh_send(uint32_t address, unsigned mv)
+ 		}
+ 		delay(1);
+ 	}
+-	printf("SWEET RPMH: TCS%u done=%d irq=%#x idle=%#x control=%#x cmd-status=%#x/%#x/%#x\n",
+-	    t, done, irq, idle, rh_read(rh_tcs, b + RH_CONTROL), status[0], status[1], status[2]);
++	printf("SWEET RPMH: TCS%u %s done=%d irq=%#x idle=%#x control=%#x cmd-status=%#x/%#x/%#x\n",
++	    t, what, done, irq, idle, rh_read(rh_tcs, b + RH_CONTROL),
++	    status[0], status[1], status[2]);
+ 	if (!done) {
+ 		printf("SWEET RPMH: timeout; TCS quarantined, IRQ remains masked; no reset/retry\n");
+ 		return ETIMEDOUT;
+@@ -320,10 +353,20 @@ rh_send(uint32_t address, unsigned mv)
+ 		return EIO;
+ 	}
+ 	rh_poisoned = false;
+-	printf("SWEET RPMH: L11C ACTIVE vote complete (rail voltage requires hardware verification)\n");
++	printf("SWEET RPMH: %s ACTIVE vote complete\n", what);
+ 	return 0;
+ }
+ 
++static int
++rh_send(uint32_t address, unsigned mv)
++{
++	/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
++	const uint32_t offsets[3] = {0, 8, 4};
++	const uint32_t values[3] = {mv, 7, 1};
++
++	return rh_tcs_run(address, offsets, values, 3, "ldoc11");
++}
++
+ int
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
+@@ -355,4 +398,46 @@ out:
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++int
++sweet_rpmh_gpu_rail_vote(const char *res, uint32_t level)
++{
++	/*
++	 * A level rail (`gfx.lvl`, `mx.lvl`, `cx.lvl`) takes one command whose
++	 * data is the level the GMU's firmware would have voted for itself.
++	 * The resource address comes from cmd-db exactly as for L11C; the level
++	 * is the value the probe measured out of the rail's own list.
++	 *
++	 * Unlike the LDO lock, this takes rh_lock because it shares the TCS
++	 * registers: two votes at once would interleave commands in one slot.
++	 */
++	if (!res || strcmp(res, "gfx.lvl")) {
++		printf("SWEET RPMH: expected gfx.lvl, got %s\n", res ? res : "(null)");
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	uint32_t address = 0;
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup_level(res, &address);
++	}
++	if (!error) {
++		const uint32_t offsets[1] = {0};
++		const uint32_t values[1] = {level};
++		error = rh_tcs_run(address, offsets, values, 1, res);
++	}
++out:
++	if (error) {
++		printf("SWEET RPMH: %s vote failed errno=%d\n", res, error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6b926fe..64e3a45 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -52,6 +52,7 @@ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
++extern void sweet_gpu_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -660,6 +661,7 @@ sweet_ufs_init(void)
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
++	sweet_gpu_init();
+ 	return 0;
+ }
+ 
