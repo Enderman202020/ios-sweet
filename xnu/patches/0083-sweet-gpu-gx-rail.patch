@@ -12,10 +12,10 @@ index 6630131..7d7f355 100644
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
 new file mode 100644
-index 0000000..22ca799
+index 0000000..b91a3bd
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,170 @@
+@@ -0,0 +1,171 @@
 +/*
 + * sweet_gpu.c - power the GPU's GX domain, which is what a probe could not do.
 + *
@@ -64,6 +64,7 @@ index 0000000..22ca799
 +#include <sys/param.h>
 +#include <sys/systm.h>
 +#include <sys/errno.h>
++#include <kern/clock.h>
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
 +
@@ -187,11 +188,16 @@ index 0000000..22ca799
 +
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
-index 4da50d8..e0b7dd2 100644
+index 4da50d8..bacc6e2 100644
 --- a/bsd/dev/sweet_rpmh.c
 +++ b/bsd/dev/sweet_rpmh.c
-@@ -160,6 +160,25 @@ rh_map(void)
+@@ -158,8 +158,28 @@ rh_map(void)
+ 	return 0;
+ }
  
++static int rh_lookup_slave(const char *res, unsigned want_slave,
++    uint32_t *address);
++
  static int
  rh_lookup(const char *res, uint32_t *address)
 +{
@@ -200,8 +206,6 @@ index 4da50d8..e0b7dd2 100644
 +	 * slave number in the top half of the address as a sanity check.  The
 +	 * shared walker does that; this is the name the callers use.
 +	 */
-+	static int rh_lookup_slave(const char *, unsigned, uint32_t *);
-+
 +	return rh_lookup_slave(res, RH_VRM, address);
 +}
 +
@@ -216,7 +220,7 @@ index 4da50d8..e0b7dd2 100644
  {
  	uint32_t key[2] = {0, 0};
  	for (unsigned i = 0; i < 8 && res[i]; ++i) {
-@@ -172,11 +191,14 @@ rh_lookup(const char *res, uint32_t *address)
+@@ -172,11 +192,14 @@ rh_lookup(const char *res, uint32_t *address)
  		if (!slave) {
  			break;
  		}
@@ -233,7 +237,7 @@ index 4da50d8..e0b7dd2 100644
  			printf("SWEET RPMH: malformed cmd-db slave header %u\n", i);
  			return EINVAL;
  		}
-@@ -186,25 +208,34 @@ rh_lookup(const char *res, uint32_t *address)
+@@ -186,25 +209,34 @@ rh_lookup(const char *res, uint32_t *address)
  				continue;
  			}
  			uint32_t addr = rh_read(rh_db, e + 16);
@@ -274,7 +278,7 @@ index 4da50d8..e0b7dd2 100644
  static bool
  rh_free(unsigned t)
  {
-@@ -219,7 +250,8 @@ rh_free(unsigned t)
+@@ -219,7 +251,8 @@ rh_free(unsigned t)
  }
  
  static int
@@ -284,7 +288,7 @@ index 4da50d8..e0b7dd2 100644
  {
  	int chosen = -1;
  	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
-@@ -234,7 +266,8 @@ rh_send(uint32_t address, unsigned mv)
+@@ -234,7 +267,8 @@ rh_send(uint32_t address, unsigned mv)
  		for (unsigned c = 0; c < rh_ncpt; ++c) {
  			if ((enabled & (1u << c)) &&
  			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == address) {
@@ -294,7 +298,7 @@ index 4da50d8..e0b7dd2 100644
  				return EBUSY;
  			}
  		}
-@@ -266,11 +299,9 @@ rh_send(uint32_t address, unsigned mv)
+@@ -266,11 +300,9 @@ rh_send(uint32_t address, unsigned mv)
  	}
  	/* From here an uncertain write/timeout quarantines our slot for this boot. */
  	rh_poisoned = true;
@@ -309,7 +313,7 @@ index 4da50d8..e0b7dd2 100644
  		uint32_t cmd = b + c * RH_CMD_STRIDE;
  		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
  		    !rh_sync(cmd + RH_ADDR, address + offsets[c]) ||
-@@ -278,7 +309,8 @@ rh_send(uint32_t address, unsigned mv)
+@@ -278,7 +310,8 @@ rh_send(uint32_t address, unsigned mv)
  			return EIO;
  		}
  	}
@@ -319,7 +323,7 @@ index 4da50d8..e0b7dd2 100644
  	    !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
  		return EIO;
  	}
-@@ -289,7 +321,7 @@ rh_send(uint32_t address, unsigned mv)
+@@ -289,7 +322,7 @@ rh_send(uint32_t address, unsigned mv)
  		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
  		idle = rh_read(rh_tcs, b + RH_STATUS);
  		bool complete = true;
@@ -328,7 +332,7 @@ index 4da50d8..e0b7dd2 100644
  			status[c] = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
  			complete &= status[c] != 0xffffffffu &&
  			    (status[c] & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
-@@ -303,8 +335,9 @@ rh_send(uint32_t address, unsigned mv)
+@@ -303,8 +336,9 @@ rh_send(uint32_t address, unsigned mv)
  		}
  		delay(1);
  	}
@@ -340,7 +344,7 @@ index 4da50d8..e0b7dd2 100644
  	if (!done) {
  		printf("SWEET RPMH: timeout; TCS quarantined, IRQ remains masked; no reset/retry\n");
  		return ETIMEDOUT;
-@@ -320,10 +353,20 @@ rh_send(uint32_t address, unsigned mv)
+@@ -320,10 +354,20 @@ rh_send(uint32_t address, unsigned mv)
  		return EIO;
  	}
  	rh_poisoned = false;
@@ -362,7 +366,7 @@ index 4da50d8..e0b7dd2 100644
  int
  sweet_rpmh_vreg_enable(const char *res, unsigned mv)
  {
-@@ -355,4 +398,46 @@ out:
+@@ -355,4 +399,46 @@ out:
  	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
  	return error;
  }
