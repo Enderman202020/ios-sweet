@@ -12,53 +12,101 @@ index 6630131..7d7f355 100644
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
 new file mode 100644
-index 0000000..b91a3bd
+index 0000000..545641a
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu.c
-@@ -0,0 +1,171 @@
+@@ -0,0 +1,573 @@
 +/*
-+ * sweet_gpu.c - power the GPU's GX domain, which is what a probe could not do.
++ * sweet_gpu.c - power the GPU's CX then GX domains.
 + *
-+ * WHY ONLY THIS
++ * WHAT CHANGED AND WHY
 + *
-+ * Four of the five GPU bring-up steps are already proven on this phone by the
-+ * shim probes booted with `fastboot boot`: the SMMU context with real page
-+ * tables, the GMU firmware running (`0xbabeface`), the HFI queues and the whole
-+ * four-message handshake.  None of that needs to move yet.
++ * The first version voted gfx.lvl, cleared SW_COLLAPSE on the GX GDSC and
++ * reported failure because bit 31 never rose:
 + *
-+ * The fifth did not work there, and cannot: the GX domain stays off because
-+ * `GPUCC_GX_GDSCR` reads `0x02220001` -- SW_COLLAPSE set, POWER_ON clear -- and
-+ * clearing SW_COLLAPSE alone gives `0x02220000` with POWER_ON still clear.  The
-+ * domain needs its supply rail `gfx.lvl` voted up through RPMh, and RPMh votes
-+ * need the RSC's TCS registers, which sweet_rpmh.c already owns.  That is the
-+ * one thing a fastboot image cannot do and a kernel driver can.
++ *     GX GDSCR before: 0x0222001  (sw_collapse=1)
++ *     GX GDSCR after:  0x8222000  (sw_collapse=0, bit 27 set, bit 31 clear)
 + *
-+ * So this file does one job and reports everything it sees:
++ * The RPMh vote itself worked:
 + *
-+ *     1. vote gfx.lvl up through sweet_rpmh.c      (the new part)
-+ *     2. clear SW_COLLAPSE on the GX GDSC
-+ *     3. read back whether POWER_ON came up
++ *     SWEET RPMH: TCS0 gfx.lvl done=1 irq=0 cmd-status=0x10101/0/0
 + *
-+ * If step 3 succeeds, the shim's remaining work (SPTPRAC, CORE_REQUEST, the
-+ * command ring) can follow, and the probe image can go back to being the place
-+ * where register sequences are tried.
++ * so the rail was up and the write reached the block (bit 27 rose).  Three
++ * independent sources say the domain is nevertheless still off, and that the
++ * order matters:
 + *
-+ * WHAT IS GUESSED AND WHAT IS NOT
++ *   1. build/gpu-regs/a6xx_gmu.c powers CX before GX (`gmu->gxpd`), because the
++ *      GX switch lives inside the CX domain.
++ *   2. The shim's own note in smmu_pt.c records the same result after trying:
++ *      "CX was brought up exactly this way ... and it worked. GX never was."
++ *   3. build/gpu-regs/a6xx.xml names a direct GX power status that this driver
++ *      never read:
 + *
-+ * Not guessed: the register offsets, the bit meanings, the absence of IPS from
-+ * TCR, the queue layout -- all measured.  Not guessed: that the vote has to
-+ * happen, because two runs showed POWER_ON refusing to rise without it.
++ *          A6XX_CX_MISC.CX_MISC_GFX_PWR_CLK_STATUS (0x0083)
++ *              bit 3  GX_GDSC_POWER_OFF   (inverted: 0 means powered)
++ *              bit 4  GX_CLK_OFF
 + *
-+ * Guessed: the *level* to vote for.  The shim read the rail's corner list out
-+ * of cmd-db and the top corner was 192, so that is what is asked for; the boot
-+ * argument `sweetgpulvl` overrides it, and the log prints what the rail held
-+ * before and after so the next run can correct it from evidence.
++ * The shim's working CX path (`smmumap.c:power_up`) also votes the bus clocks
++ * after clearing SW_COLLAPSE; this driver did not:
++ *
++ *     GCC_GPU_MEMNOC_GFX   |= CBCR_ON
++ *     GCC_GPU_SNOC_DVM_GFX |= CBCR_ON
++ *     GPUCC_SMMU_VOTE      |= CBCR_ON
++ *
++ * Measured so far (build/ios/cxfirst.log, gxclk.log):
++ *
++ *     CX GDSCR  0x222001 -> 0xf8222000 (power_on=1)   CX COMES UP
++ *     GX GDSCR  0x222001 -> 0x8222000 (power_on=0)    GX STAYS DARK
++ *     GX clock votes refused: bit 31 returns after every write
++ *
++ * which kills three hypotheses: the rail vote, the CX parent, SW_COLLAPSE.
++ *
++ * v4's boot answered one question and asked two more.  The SPTPRAC write
++ * SURVIVED (CX was up; the same write killed the firmware three times from
++ * the shim) and the GMU block answered: `SPTPRAC status 0xd4` = everything
++ * off.  Two things were wrong with that attempt: the GX GDSC was still held
++ * in SW_COLLAPSE (v4 replaced that step instead of keeping it), and -- the
++ * bigger finding -- the status this whole project has been reading for GX
++ * is the wrong register.  gpucc-sm6350.c (the layout this phone's DT
++ * matches: gdsc nodes at 0x100c/0x106c) defines the GX GDSC with
++ * POLL_CFG_GDSCR and CLAMP_IO:
++ *
++ *     .gdscr         = 0x100c
++ *     .clamp_io_ctrl = 0x1508    CLAMP_IO: deassert BEFORE toggling
++ *     status         = gdscr + 4 POLL_CFG_GDSCR: POWER_UP_COMPLETE bit 16
++ *
++ * CX is the mirror case: its status is gds_hw_ctrl 0x1540 bit 31 -- exactly
++ * the register whose bit 31 rose here when CX came up.  Two domains, two
++ * status mechanisms; v2-v4 read CX's mechanism on GX and concluded "dark"
++ * from a register GX does not report power in.
++ *
++ * v5's boot measured the GX FSM responding for the first time: the CFG
++ * register left power_down_complete (bit 15 cleared, bit 24 rose) and the
++ * SPTP status stopped reporting GX_GDSC_POWER_OFF -- but POWER_UP_COMPLETE
++ * never set, and the final SPTPRAC write changed nothing (0x94).  v5 also
++ * had two blind spots: the clamp write at 0x1508 was never read back, and
++ * 0x1508 was treated as a clamp when downstream kernels give the GX GDSC a
++ * gds_hw_ctrl whose power status is bit 31 -- the CX mirror, since CX's
++ * status showed up at ITS gds_hw_ctrl (0x1540 bit 31).
++ *
++ * So this version isolates the two steps and prints every candidate:
++ *
++ *     1. votes gfx.lvl                       (unchanged, proven)
++ *     2. brings CX up first                  (unchanged, proven)
++ *     3. votes the bus clocks CX needs       (unchanged, proven)
++ *     4. votes GPLL0's GPU branches (gcc-sm7150.c bits 15/16 of 0x52004)
++ *     5. GX attempt A: clear SW_COLLAPSE only, poll CFG bit 16 /
++ *        0x1508 bit 31 / GDSCR bit 31
++ *     6. GX attempt B (if A failed): deassert the clamp, re-clear, poll
++ *     7. SPTPRAC corroboration; verdict printed from all sources
++ *
++ * If neither attempt completes the FSM, the remaining mover is the GMU
++ * firmware itself -- mainline's design, and the next wave regardless.
 + *
 + * BOOT ARGUMENT
 + *
-+ *     sweetgpu=1        attempt it at all (default off: this must not be able
-+ *                       to break a normal boot)
-+ *     sweetgpulvl=<n>   the level to vote for (default 192)
++ *     sweetgpu=1        attempt it at all (default off)
++ *     sweetgpulvl=<n>   the rail level to vote for (default 192)
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
@@ -71,41 +119,303 @@ index 0000000..b91a3bd
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +extern int sweet_rpmh_gpu_rail_vote(const char *res, uint32_t level);
 +
-+#define GPUCC_BASE	0x05090000UL
-+#define GPUCC_GX_GDSCR	0x100c
++#define GPUCC_BASE		0x05090000UL
++#define GCC_BASE		0x00100000UL
 +
++/* GPUCC power switches and clocks (gpuprobe_regs.h, from gpucc-sm6350.c) */
++#define GPUCC_GX_GDSCR		0x100c
++#define GPUCC_CX_GDSCR		0x106c
++#define GPUCC_CX_HW_CTRL	0x1540
++#define GPUCC_SMMU_VOTE		0x5000
++#define GPUCC_CXO_AON		0x1004
++#define GPUCC_AHB		0x1078
++#define GPUCC_CX_GMU		0x1098
++#define GPUCC_CXO		0x109c
++
++/* GCC bus clocks the working CX path votes */
++#define GCC_GPU_MEMNOC_GFX	0x7100c
++#define GCC_GPU_SNOC_DVM_GFX	0x71018
++
++/*
++ * GPLL0 is the parent the GPU's clock sources hang off (gcc-sm7150.c:
++ * gcc_gpu_gpll0_clk_src / _div are BITS 15 and 16 of this vote register).
++ * The PLL itself is a system clock Android leaves running; these two
++ * branches are what this driver can vote.
++ */
++#define GCC_PLL_VOTE		0x52004
++#define GCC_GPU_GPLL0_VOTE	(1u << 15)
++#define GCC_GPU_GPLL0_DIV_VOTE	(1u << 16)
++
++/*
++ * The GMU block and the registers of the SPTP power/clock sequencer that
++ * actually owns GX (gpuprobe_regs.h; a6xx_gmu.xml names the same registers
++ * as words 0x1a881 and 0x1f8d0 of the GPU block = the byte offsets below).
++ */
++#define GMU_BASE		0x0506a000UL
++#define GMU_GX_SPTPRAC_POWER_CONTROL	GMU_WORD(0x0081)	/* 0x204 */
++#define GMU_SPTPRAC_PWR_CLK_STATUS	GMU_WORD(0x50d0)	/* 0x14340 */
++#define GMU_WORD(n)		(4u * (n))
++
++/*
++ * The GX GDSC's real registers, from gpucc-sm6350.c -- the layout this
++ * phone's DT matches (gdsc nodes at 0x100c and 0x106c).  GX is the domain
++ * with POLL_CFG_GDSCR: its power status lives in the CFG register at
++ * gdscr+4, bit 16 (POWER_UP_COMPLETE), NOT in gdscr bit 31.  It also has
++ * CLAMP_IO: the I/O clamp at 0x1508 must be released before the domain can
++ * power up, which nothing in this project has ever done for GX.
++ */
++#define GPUCC_GX_CFG_GDSCR	(GPUCC_GX_GDSCR + 4)	/* 0x1010 */
++#define GPUCC_GX_CLAMP_IO_CTRL	0x1508
++#define GDSC_POWER_UP_COMPLETE	(1u << 16)
++#define GDSC_POWER_DOWN_COMPLETE	(1u << 15)
++#define GDSC_GMEM_CLAMP_IO	(1u << 0)
++
++/*
++ * The CX mirror, for the record: gpucc-sm6350.c gives CX gds_hw_ctrl =
++ * 0x1540, and gdsc.c reads a gds_hw_ctrl domain's status THERE (bit 31) --
++ * which is why CX's power-on showed up at 0x1540 bit 31 and GX never showed
++ * at 0x100c bit 31.  Both facts are now explained by the same line.
++ */
++
++/*
++ * GX's own clock branches (gpuprobe_regs.h).  The gxclk boot measured what
++ * writing them does while the domain is collapsed: bit 31 (OFF) returns on
++ * every register, so the hardware holds them shut.  They are still voted,
++ * after SPTPRAC succeeds, as confirmation -- but they are not the key.
++ */
++#define GPUCC_GX_GFX3D		0x1054
++#define GPUCC_GX_GMU		0x1064
++#define GPUCC_GX_CXO		0x1060
++
++/* A clock branch's control register */
++#define CBCR_ON			(1u << 0)
++
++/* A power switch (gdsc.c) */
 +#define GDSC_SW_COLLAPSE	(1u << 0)
++#define GDSC_HW_CONTROL		(1u << 1)
 +#define GDSC_POWER_ON		(1u << 31)
 +
++/*
++ * GX_STATUS_POWER_OFF_BIT is recorded but NOT read here: the XML gives the
++ * offset inside the A6XX_CX_MISC domain but not the domain's base address in
++ * the SoC map, and this file has no measured value for it.  Reading a wrong
++ * address already collapsed the GMU once during bring-up (the 0x05050000
++ * incident), so a speculative read is worse than no read.  The SPTPRAC status
++ * register (GMU_SPTPRAC_PWR_CLK_STATUS) is the trusted verdict instead --
++ * mainline's a6xx_gmu_gx_is_on() uses its bits 6:7 for exactly this question.
++ */
++#define GX_STATUS_OFFSET_IN_CX_MISC	0x0083
++#define GX_STATUS_POWER_OFF_BIT		(1u << 3)
++#define GX_STATUS_CLK_OFF_BIT		(1u << 4)
++
 +static vm_offset_t gpucc;
++static vm_offset_t gcc;
++static vm_offset_t gmu;
 +
 +static uint32_t
-+gpucc_rd(uint32_t off)
++reg_rd(vm_offset_t base, uint32_t off)
 +{
-+	uint32_t v = *(volatile uint32_t *)(gpucc + off);
++	uint32_t v = *(volatile uint32_t *)(base + off);
 +	__asm__ volatile("dmb oshld" ::: "memory");
 +	return v;
 +}
 +
 +static void
-+gpucc_wr(uint32_t off, uint32_t v)
++reg_wr(vm_offset_t base, uint32_t off, uint32_t v)
 +{
 +	__asm__ volatile("dmb oshst" ::: "memory");
-+	*(volatile uint32_t *)(gpucc + off) = v;
++	*(volatile uint32_t *)(base + off) = v;
 +	__asm__ volatile("dsb osh" ::: "memory");
 +}
 +
 +/*
-+ * Turn the GX domain on.  Returns 0 when POWER_ON is set afterwards.
++ * Release one GDSC and wait for POWER_ON.  Returns 1 when it came up.
 + *
-+ * The order is: vote the rail, then release the switch, then wait.  Releasing
-+ * the switch first was tried from the shim and produced 0x02220000 with the
-+ * domain still dark, so the vote has to come first.
++ * This is the shim's power_up() logic: refuse to fight the hardware when
++ * HW_CONTROL is set, otherwise clear SW_COLLAPSE and poll.
++ */
++static int
++gdsc_release(vm_offset_t base, uint32_t gdscr_off, uint32_t hwctrl_off,
++    const char *name)
++{
++	uint32_t gdscr = reg_rd(base, gdscr_off);
++	uint32_t hw = hwctrl_off ? reg_rd(base, hwctrl_off) : 0;
++
++	printf("SWEET GPU: %s GDSCR %#x (power_on=%u sw_collapse=%u hw_control=%u)\n",
++	    name, gdscr, (gdscr >> 31) & 1, gdscr & 1, (gdscr >> 1) & 1);
++
++	if ((gdscr | hw) & GDSC_POWER_ON) {
++		printf("SWEET GPU: %s already powered\n", name);
++		return 1;
++	}
++	if (gdscr & GDSC_HW_CONTROL) {
++		printf("SWEET GPU: %s is under hardware control; will not force it\n",
++		    name);
++		return 0;
++	}
++
++	reg_wr(base, gdscr_off, gdscr & ~GDSC_SW_COLLAPSE);
++
++	for (int i = 0; i < 500; i++) {
++		gdscr = reg_rd(base, gdscr_off);
++		hw = hwctrl_off ? reg_rd(base, hwctrl_off) : 0;
++		if ((gdscr | hw) & GDSC_POWER_ON)
++			break;
++		delay(1);
++	}
++
++	gdscr = reg_rd(base, gdscr_off);
++	hw = hwctrl_off ? reg_rd(base, hwctrl_off) : 0;
++	printf("SWEET GPU: %s GDSCR now %#x (power_on=%u sw_collapse=%u)\n",
++	    name, gdscr, (gdscr >> 31) & 1, gdscr & 1);
++
++	return ((gdscr | hw) & GDSC_POWER_ON) ? 1 : 0;
++}
++
++/*
++ * Vote a GCC clock branch on.  Same as the shim's CBCR_ON writes.
++ */
++static void
++gcc_clock_on(uint32_t off, const char *name)
++{
++	uint32_t v = reg_rd(gcc, off);
++
++	printf("SWEET GPU: %s before %#x\n", name, v);
++	if (v & CBCR_ON) {
++		printf("SWEET GPU: %s already on\n", name);
++		return;
++	}
++	reg_wr(gcc, off, v | CBCR_ON);
++	v = reg_rd(gcc, off);
++	printf("SWEET GPU: %s after %#x (on=%u)\n", name, v, v & 1);
++}
++
++/*
++ * Vote a GPUCC clock branch on.  Same shape as the GCC helper but with the
++ * GPUCC base.  CBCR: bit 0 = ON, bit 31 = OFF.
++ */
++static void
++gpucc_clock_on(uint32_t off, const char *name)
++{
++	uint32_t v = reg_rd(gpucc, off);
++
++	printf("SWEET GPU: %s before %#x\n", name, v);
++	if (v & 0x80000000u) {
++		/* Clear the OFF bit rather than just setting ON. */
++		reg_wr(gpucc, off, (v & ~0x80000000u) | CBCR_ON);
++		v = reg_rd(gpucc, off);
++		printf("SWEET GPU: %s after clearing OFF %#x (on=%u)\n", name, v, v & 1);
++		return;
++	}
++	if (v & CBCR_ON) {
++		printf("SWEET GPU: %s already on\n", name);
++		return;
++	}
++	reg_wr(gpucc, off, v | CBCR_ON);
++	v = reg_rd(gpucc, off);
++	printf("SWEET GPU: %s after %#x (on=%u)\n", name, v, v & 1);
++}
++
++/*
++ * Drive the SPTP sequencer, the piece of hardware that actually switches GX.
++ *
++ * mainline a6xx_sptprac_enable(): write 0x778000, then poll
++ * SPTPRAC_PWR_CLK_STATUS until bits 5:3 == 0x28, i.e. bit 5 (GMU_UP_POWER_
++ * STATE) and bit 3 (SPTPRAC_GDSC_POWER_ON) set, bits 4 (SP_CLOCK_OFF) and 2
++ * (SPTPRAC_GDSC_POWER_OFF) clear.  100 polls of 1 us, as there.
++ */
++static int
++sptprac_enable(void)
++{
++	uint32_t status = 0;
++
++	printf("SWEET GPU: SPTPRAC control 0x778000 ->\n");
++	reg_wr(gmu, GMU_GX_SPTPRAC_POWER_CONTROL, 0x778000);
++
++	for (int i = 0; i < 100; i++) {
++		status = reg_rd(gmu, GMU_SPTPRAC_PWR_CLK_STATUS);
++		if ((status & 0x38) == 0x28)
++			break;
++		delay(1);
++	}
++
++	printf("SWEET GPU: SPTPRAC status %#x (want bits 5:3 = 0x28)\n", status);
++	return ((status & 0x38) == 0x28) ? 1 : 0;
++}
++
++/*
++ * Poll the three GX status candidates for `ms` milliseconds after a move.
++ *
++ * The success test is CFG bit 16 (POWER_UP_COMPLETE of POLL_CFG_GDSCR, the
++ * verdict mainline trusts for this domain).  Any change in any candidate is
++ * printed the moment it happens, so a transient state is not lost between
++ * snapshots; the poll returns as soon as bit 16 rises.
++ */
++static void
++gx_poll(const char *tag, uint32_t ms)
++{
++	uint32_t last_cfg = 0xffffffffu, last_ctrl = 0xffffffffu;
++	uint32_t last_gd = 0xffffffffu;
++
++	for (uint32_t i = 0; i < ms; i++) {
++		uint32_t cfg = reg_rd(gpucc, GPUCC_GX_CFG_GDSCR);
++		uint32_t ctrl = reg_rd(gpucc, GPUCC_GX_CLAMP_IO_CTRL);
++		uint32_t gd = reg_rd(gpucc, GPUCC_GX_GDSCR);
++
++		if (cfg != last_cfg || ctrl != last_ctrl || gd != last_gd) {
++			printf("SWEET GPU: [poll %s %ums] CFG %#x (up=%u down=%u) "
++			    "0x1508 %#x (b31=%u) GDSCR %#x (b31=%u)\n",
++			    tag, i, cfg, (cfg >> 16) & 1, (cfg >> 15) & 1,
++			    ctrl, (ctrl >> 31) & 1, gd, (gd >> 31) & 1);
++			last_cfg = cfg;
++			last_ctrl = ctrl;
++			last_gd = gd;
++		}
++		if (cfg & GDSC_POWER_UP_COMPLETE)
++			return;
++		delay(1);
++	}
++}
++
++/*
++ * The GX verdict, from the register mainline actually trusts for this
++ * domain: gpucc-sm6350.c gives GX POLL_CFG_GDSCR, so gdsc.c reads the CFG
++ * register at gdscr+4 and checks POWER_UP_COMPLETE (bit 16).  The GDSCR
++ * bit 31 and the SPTPRAC bits are printed for comparison, not trusted.
++ */
++static int
++gx_is_on(void)
++{
++	uint32_t cfg = reg_rd(gpucc, GPUCC_GX_CFG_GDSCR);
++	uint32_t gx = reg_rd(gpucc, GPUCC_GX_GDSCR);
++	uint32_t cx = reg_rd(gpucc, GPUCC_CX_GDSCR);
++	uint32_t hw = reg_rd(gpucc, GPUCC_CX_HW_CTRL);
++	uint32_t clamp = reg_rd(gpucc, GPUCC_GX_CLAMP_IO_CTRL);
++	uint32_t sp = reg_rd(gmu, GMU_SPTPRAC_PWR_CLK_STATUS);
++
++	printf("SWEET GPU: GX CFG %#x (power_up_complete=%u power_down_complete=%u)\n",
++	    cfg, (cfg >> 16) & 1, (cfg >> 15) & 1);
++	printf("SWEET GPU: SP status %#x (gx_gdsc_off=%u gx_clk_off=%u)\n",
++	    sp, (sp >> 6) & 1, (sp >> 7) & 1);
++	printf("SWEET GPU: status CX %#x (on=%u) GX %#x (on=%u) hw_ctrl %#x\n",
++	    cx, (cx >> 31) & 1, gx, (gx >> 31) & 1, hw);
++	/*
++	 * 0x1508, both readings: as the CLAMP_IO control (bit 0 asserted =
++	 * clamped) and as the downstream's candidate GX gds_hw_ctrl (bit 31 =
++	 * powered).  v5 never printed either after the attempt.
++	 */
++	printf("SWEET GPU: gx 0x1508 %#x (clamp_io=%u hw_ctrl_bit31=%u)\n",
++	    clamp, clamp & 1, (clamp >> 31) & 1);
++	return (cfg & GDSC_POWER_UP_COMPLETE) ? 1 : 0;
++}
++
++/*
++ * Bring the GPU's power domains up: CX first, then the bus clocks CX needs,
++ * then GX.  Returns 0 when GX reports powered.
 + */
 +int
 +sweet_gpu_gx_power_on(uint32_t level)
 +{
-+	uint32_t before, after;
 +	int error;
 +
 +	if (!gpucc) {
@@ -115,43 +425,137 @@ index 0000000..b91a3bd
 +			return ENOMEM;
 +		}
 +	}
-+
-+	before = gpucc_rd(GPUCC_GX_GDSCR);
-+	printf("SWEET GPU: GX GDSCR before: %#x (power_on=%u sw_collapse=%u)\n",
-+	    before, (before >> 31) & 1, before & 1);
-+
-+	if (before & GDSC_POWER_ON) {
-+		printf("SWEET GPU: GX was already on; nothing to do\n");
-+		return 0;
++	if (!gcc) {
++		gcc = ml_io_map(GCC_BASE, 0x100000);
++		if (!gcc) {
++			printf("SWEET GPU: GCC did not map\n");
++			return ENOMEM;
++		}
++	}
++	if (!gmu) {
++		gmu = ml_io_map(GMU_BASE, 0x20000);
++		if (!gmu) {
++			printf("SWEET GPU: GMU did not map\n");
++			return ENOMEM;
++		}
 +	}
 +
-+	/*
-+	 * The vote.  This is the step the probe images could not take: the TCS
-+	 * registers belong to sweet_rpmh.c.
-+	 */
++	printf("SWEET GPU: --- before anything ---\n");
++	gx_is_on();
++
++	/* 1. the rail.  Proven to work; keep it first. */
 +	printf("SWEET GPU: voting gfx.lvl = %u\n", level);
 +	error = sweet_rpmh_gpu_rail_vote("gfx.lvl", level);
 +	if (error) {
 +		printf("SWEET GPU: the rail vote failed (%d); GX will stay off\n", error);
 +		return error;
 +	}
-+
-+	/* Let the rail settle before asking the domain to use it. */
 +	delay(10);
 +
-+	gpucc_wr(GPUCC_GX_GDSCR, before & ~GDSC_SW_COLLAPSE);
-+	for (int i = 0; i < 500; i++) {
-+		after = gpucc_rd(GPUCC_GX_GDSCR);
-+		if (after & GDSC_POWER_ON)
-+			break;
-+		delay(1);
++	/*
++	 * 2. CX first.  GX sits inside CX, so this is the parent domain.  The
++	 *    shim proved this exact sequence brings CX up.
++	 */
++	printf("SWEET GPU: --- CX ---\n");
++	if (!gdsc_release(gpucc, GPUCC_CX_GDSCR, GPUCC_CX_HW_CTRL, "CX")) {
++		printf("SWEET GPU: CX did not come up; GX cannot either\n");
++		gx_is_on();
++		return ENODEV;
 +	}
-+	after = gpucc_rd(GPUCC_GX_GDSCR);
-+	printf("SWEET GPU: GX GDSCR after: %#x (power_on=%u sw_collapse=%u)\n",
-+	    after, (after >> 31) & 1, after & 1);
 +
-+	if (!(after & GDSC_POWER_ON)) {
-+		printf("SWEET GPU: the rail vote landed but the domain did not come up\n");
++	/*
++	 * 3. the bus clocks the working CX path votes.  Without these the GPU
++	 *    block has power but no way to move data.
++	 */
++	printf("SWEET GPU: --- bus clocks ---\n");
++	gcc_clock_on(GCC_GPU_MEMNOC_GFX, "GCC_GPU_MEMNOC_GFX");
++	gcc_clock_on(GCC_GPU_SNOC_DVM_GFX, "GCC_GPU_SNOC_DVM_GFX");
++	reg_wr(gpucc, GPUCC_SMMU_VOTE,
++	    reg_rd(gpucc, GPUCC_SMMU_VOTE) | CBCR_ON);
++	printf("SWEET GPU: GPUCC_SMMU_VOTE now %#x\n",
++	    reg_rd(gpucc, GPUCC_SMMU_VOTE));
++	delay(1);
++
++	/*
++	 * 4. GPLL0's GPU branches (gcc-sm7150.c: bits 15/16 of 0x52004) and
++	 *    the GMU's own interface clocks.  gmustart.c measured this project
++	 *    hanging the bus when a GMU register was written with the latter
++	 *    off.  CX is up now, which is what gates them.
++	 */
++	printf("SWEET GPU: --- gpll0 + gmu clocks ---\n");
++	{
++		uint32_t v = reg_rd(gcc, GCC_PLL_VOTE);
++		printf("SWEET GPU: GCC_PLL_VOTE before %#x\n", v);
++		v |= GCC_GPU_GPLL0_VOTE | GCC_GPU_GPLL0_DIV_VOTE;
++		reg_wr(gcc, GCC_PLL_VOTE, v);
++		v = reg_rd(gcc, GCC_PLL_VOTE);
++		printf("SWEET GPU: GCC_PLL_VOTE now %#x (gpu=%u gpu_div=%u)\n",
++		    v, (v >> 15) & 1, (v >> 16) & 1);
++	}
++	gpucc_clock_on(GPUCC_CXO_AON, "GPUCC_CXO_AON");
++	gpucc_clock_on(GPUCC_CXO, "GPUCC_CXO");
++	gpucc_clock_on(GPUCC_AHB, "GPUCC_AHB");
++	gpucc_clock_on(GPUCC_CX_GMU, "GPUCC_CX_GMU");
++	delay(10);
++
++	/*
++	 * 5. the GX GDSC, in two isolated attempts.  v5 did both moves
++	 *    (clamp release + collapse clear) in one step and left the
++	 *    FSM stuck between its two "complete" states; these separate
++	 *    them so the next boot knows which move the domain answers.
++	 *
++	 *    Attempt A is the pure gdsc.c CPU path minus the clamp:
++	 *    clear SW_COLLAPSE and poll, printing every status candidate.
++	 *    Attempt B adds the clamp release from gpucc-sm6350.c
++	 *    (CLAMP_IO: deassert BEFORE the toggle), then re-clears.
++	 */
++	printf("SWEET GPU: --- GX attempt A (collapse only) ---\n");
++	{
++		uint32_t gdscr = reg_rd(gpucc, GPUCC_GX_GDSCR);
++		printf("SWEET GPU: GX GDSCR %#x (sw_collapse=%u) -> clearing\n",
++		    gdscr, gdscr & 1);
++		reg_wr(gpucc, GPUCC_GX_GDSCR, gdscr & ~GDSC_SW_COLLAPSE);
++	}
++	gx_poll("A", 400);
++
++	if (gx_is_on())
++		goto sp_check;
++
++	printf("SWEET GPU: --- GX attempt B (clamp release + re-clear) ---\n");
++	{
++		uint32_t clamp = reg_rd(gpucc, GPUCC_GX_CLAMP_IO_CTRL);
++		printf("SWEET GPU: GX clamp_io %#x -> releasing\n", clamp);
++		reg_wr(gpucc, GPUCC_GX_CLAMP_IO_CTRL,
++		    clamp & ~GDSC_GMEM_CLAMP_IO);
++		printf("SWEET GPU: GX clamp_io readback %#x (clamp_io=%u)\n",
++		    reg_rd(gpucc, GPUCC_GX_CLAMP_IO_CTRL),
++		    reg_rd(gpucc, GPUCC_GX_CLAMP_IO_CTRL) & 1);
++
++		/* the re-clear, per gdsc.c's toggle: set then clear */
++		uint32_t gdscr = reg_rd(gpucc, GPUCC_GX_GDSCR);
++		reg_wr(gpucc, GPUCC_GX_GDSCR, gdscr | GDSC_SW_COLLAPSE);
++		delay(10);
++		gdscr = reg_rd(gpucc, GPUCC_GX_GDSCR);
++		reg_wr(gpucc, GPUCC_GX_GDSCR, gdscr & ~GDSC_SW_COLLAPSE);
++		printf("SWEET GPU: GX GDSCR toggled; final write %#x\n",
++		    gdscr & ~GDSC_SW_COLLAPSE);
++	}
++	gx_poll("B", 400);
++
++	if (gx_is_on())
++		goto sp_check;
++
++	printf("SWEET GPU: GX GDSC did not report power-up after A or B\n");
++
++sp_check:
++	/* 6. corroboration: the sequencer and the GX clock branches. */
++	(void)sptprac_enable();
++	gpucc_clock_on(GPUCC_GX_GFX3D, "GX_GFX3D");
++	gpucc_clock_on(GPUCC_GX_GMU, "GX_GMU");
++	gpucc_clock_on(GPUCC_GX_CXO, "GX_CXO");
++
++	if (!gx_is_on()) {
++		printf("SWEET GPU: GX did not stay powered\n");
 +		return ENODEV;
 +	}
 +
@@ -160,12 +564,10 @@ index 0000000..b91a3bd
 +}
 +
 +/*
-+ * Called once from sweet_ufs.c after the root is mounted, which is late enough
-+ * that the RPMh client has been used successfully for L11C and early enough to
-+ * be before anything wants the GPU.
++ * Called once from sweet_ufs.c after the root is mounted.
 + *
-+ * Off unless `sweetgpu=1`.  A bring-up step that can reset the GPU's rail has
-+ * no business running on a normal boot.
++ * Off unless `sweetgpu=1`, because a bring-up step that can reset the GPU rail
++ * has no business running on a normal boot.
 + */
 +void
 +sweet_gpu_init(void)
@@ -180,7 +582,7 @@ index 0000000..b91a3bd
 +
 +	printf("SWEET GPU: starting (level %u)\n", level);
 +	if (sweet_gpu_gx_power_on(level) == 0) {
-+		printf("SWEET GPU: done; the shim's remaining steps can follow\n");
++		printf("SWEET GPU: done; CX and GX are up\n");
 +	} else {
 +		printf("SWEET GPU: gave up; see the lines above\n");
 +	}
