@@ -1,5 +1,53 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## >>> UPDATE 2026-11-20 17:50: сборка ядра перенесена на MacBook, идёт <<<
+
+GitHub не даёт macOS-раннеров (три прогона подряд: `The job was not acquired by
+Runner of type hosted`), поэтому сборка идёт локально на ноутбуке пользователя:
+`kirillfeofilov@192.168.0.196`, macOS 12.7.6, Xcode 14.2, Intel i3-6006U, 8 ГБ.
+
+Всё в одной папке `~/Desktop/ios-sweet-build/` на Рабочем столе. `sudo` не
+использовался, Homebrew не ставился. Подробности и все замеры —
+`docs/BUILD-ON-MAC.md`.
+
+**Почему Mac решает проблему, которую не решил Linux:**
+
+| | Linux | Mac |
+|---|---|---|
+| `-image_base` / `-segaddr` в линкере | нет в `lld` | есть в Apple `ld` |
+| `libcc_kext.a` | отсутствует | в Xcode 14.2 |
+| `libfirehose_kernel.a` | отсутствует | `build.sh` собирает сам |
+
+**Состояние сборки (pid 2523, лог `logs/build.out`):**
+
+- `MACOS_VERSION=13.5` → xnu-8796.141.3, KDK 22G74
+- `KDKROOT` указывает в нашу папку → ветка с `sudo installer` не выполняется
+- 83 из 83 патчей применились, 0 пропущено, 0 ошибок — включая `0083`
+- этап: `Installing xnu headers`
+
+**Три бага, найденных прогоном (все исправлены):**
+
+1. **CRLF в патчах.** `core.autocrlf=true` в этом репозитории → рабочая копия с
+   CRLF → `set -euo pipefail` приезжает как `pipefail\r`, bash падает. Опаснее
+   то, что `.patch` падали молча: `git apply --check` не проходит, `build.sh`
+   пишет warning и едет дальше. Сборка «успешна», а дерево без патчей.
+   Исправление: `scripts/export-patches.py` берёт блобы из git (`cat-file blob
+   HEAD:<path>`), там LF. Проверено: 0 файлов с CRLF из 86.
+2. **`setup_xcode_toolchain()` пересобирает PATH** и теряет наш `bin/jq`.
+   Добавили `bin/` в `SYSTEM_PATHS`.
+3. **`bearssl.org` git-эндпоинт таймаутит.** Хост живой (homepage 200,
+   `ls-remote` отдаёт нужный коммит), но соединение рвётся. Обернули fetch в
+   5 попыток; коммит запинен, поэтому повторы безопасны.
+
+**Что дальше:** дождаться компиляции (на 2 ядрах это часы), затем проверить
+`kernel.development.sweet` на наличие `sweet_gpu_init` / `SWEET GPU` и грузить
+с `sweetgpu=1`.
+
+**Старый артефакт не годится:** `build/kernel.development.sweet` собран
+2026-11-15 и не содержит GPU-драйвер — в нём патчи только до 0082.
+
+---
+
 ## >>> UPDATE 2026-11-20 00:36: GPU разбит на две части, GX уходит в ядро <<<
 
 **Готово и проверено на железе (шим, `fastboot boot build/ios/gpuprobe.img`):**
