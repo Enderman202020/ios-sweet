@@ -1,5 +1,37 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## >>> UPDATE 2026-11-20 18:10: ЯДРО СОБРАНО НА МАКЕ, GPU-ДРАЙВЕР ВНУТРИ <<<
+
+`build/mac-kernel/kernel.development.sweet` — 16.5 МБ, SHA256
+`7a476005f41928f9f984a34ecafc9fa259d71dc873068f76425422c8f1a21c04` (совпадает
+с копией на Маке побайтно). Проверено `nm` и `strings`, не на глаз:
+
+| Проверка | Результат |
+|---|---|
+| Mach-O | `64-bit executable arm64` |
+| `__TEXT` vmaddr | `0xfffffe0007004000` — верный адрес линковки |
+| `_sweet_gpu_init` | external, `__TEXT_EXEC,__text` |
+| `_sweet_gpu_gx_power_on` | external |
+| `"SWEET GPU"`, `"gfx.lvl"` | найдены |
+
+Старый артефакт от 15.11 этих символов **не содержит** — это первое ядро с
+драйвером GX.
+
+**Пять багов найдено прогоном** (все исправлены, подробности в
+`docs/BUILD-ON-MAC.md`):
+
+1. CRLF в 81 из 91 `.patch` и 3 из 3 `.sh` — `core.autocrlf=true`; `.patch`
+   падали молча (warning + продолжение). Берём блобы из git.
+2. `setup_xcode_toolchain()` пересобирает PATH → теряется `jq`.
+3. `bearssl.org` git-эндпоинт таймаутит → 5 повторов.
+4. **`-ftrivial-auto-var-init=zero`** — 1041 ошибка. Патч `0001` удаляет
+   обязательный companion-флаг; верно для clang 15+ (Xcode 16), неверно для
+   clang 14 (Xcode 14.2). Патч отключён на этой машине, upstream не тронут.
+5. Финальный `make install` падает на `lldbmacros/core/collections.py`
+   (затеняет stdlib `collections`) — только LLDB-макросы, ядро уже собрано.
+
+---
+
 ## >>> UPDATE 2026-11-20 17:50: сборка ядра перенесена на MacBook, идёт <<<
 
 GitHub не даёт macOS-раннеров (три прогона подряд: `The job was not acquired by
