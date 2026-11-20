@@ -1,5 +1,55 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## >>> UPDATE 2026-11-20 19:10: ЯДРО С МАКА ГРУЗИТ iOS, ЛОГ ПРОЧИТАН <<<
+
+**iOS 16 дошла до экрана блокировки** на ядре, собранном на MacBook. Лог снят
+через OrangeFox recovery из раздела `iosroot` (не `userdata`!).
+
+**Где лог:** patch 0047 пишет кольцо в КОНЕЦ раздела `iosroot` (`/dev/block/sda35`,
+24 ГиБ, HFS+). Заголовок `SWEETLOG`, ring 4 МиБ. Читать блочно (`dd`), recovery
+HFS+ не монтирует. Декодер — `scripts/read-sweetlog.py`, текст —
+`build/ios/gpukernel.log` (3134 строки).
+
+**Banner подтверждает, что ядро с Мака:**
+```
+Darwin Kernel Version 22.6.0: ...; kirillfeofilov:xnu-8796.141.3
+```
+У CI-сборок там `runner:`, здесь `kirillfeofilov:`.
+
+**Загрузка дошла до userspace:**
+```
+SWEET UFS: "iosroot" on LUN 0: first block 0x177d700, 24576 MiB, read-write
+hfs: mounted iOSRoot on device b(1, 0)
+exec sshd
+SMP SpringBoard[26] slide 0x5a54000 mh 0x104974000
+```
+То, что выглядело зависанием, — покой на экране блокировки без ввода.
+
+**Причина неработающего тача найдена (в логе):**
+```
+SWEET TOUCH: probe xfer addr=0x5d write len=2 err=0
+SWEET TOUCH: probe raw 0x4022: 00 00 00 00 00 00 00 00
+SWEET TOUCH: probe 0x5d err=0 pid=00000000 fw=00.00.00.00
+SWEET TOUCH: probe raw 0x8240: e6 3b e6 7f e5 d8 1b 6f ...
+SWEET TOUCH: no unique supported IC (goodix=0 fts=0 dead=0); stopping
+```
+SPI работает (`err=0`), но PID по адресу `0x4022` читается нулями, а код требует
+строку `9896`. На телефоне стоит `goodix_ts` (подтверждено из Android). Похоже,
+`0x4022` — адрес для старой серии GT9xxx, а у этой модели ID в другом месте
+(район `0x8240`, откуда уже приходят осмысленные байты). **Правка в
+`sweet_touch.c`, не в GPU.**
+
+**GPU на этой загрузке не запускался:** в логе нет ни одной `SWEET GPU:` —
+образ `gpcpu-full.img` собран БЕЗ `sweetgpu=1`. Готов и проверен
+`build/ios/gpcpu-full-gpu.img` с `sweetgpu=1 sweetgpulvl=192`.
+
+**Два бага в тулинге, исправлены:** PowerShell снимал кавычки до `ssh` (cmdline
+обрезался до `debug=0xc`), и мой верификатор неверно читал образ (искал gzip и
+страницы 2048 вместо 4096/несжатого). Теперь cmdline передаётся файлом
+(`scripts/vm-pack-args.sh`) и проверяется обратным разбором образа.
+
+---
+
 ## >>> UPDATE 2026-11-20 18:35: откат батарейного патча, батарея РАБОТАЕТ с флешки <<<
 
 Патч `SSDT-USBX.aml` (байт `0x72`, `Darwin` → `Xarwin`) **откачен**. Проверено:
