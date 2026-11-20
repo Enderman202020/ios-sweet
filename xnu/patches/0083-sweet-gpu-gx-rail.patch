@@ -14,10 +14,10 @@ index 6630131..0b5e5f9 100644
  bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/sweet_gmu.c b/bsd/dev/sweet_gmu.c
 new file mode 100644
-index 0000000..10075b9
+index 0000000..c854d7b
 --- /dev/null
 +++ b/bsd/dev/sweet_gmu.c
-@@ -0,0 +1,1131 @@
+@@ -0,0 +1,1179 @@
 +/*
 + * sweet_gmu.c - start the GMU firmware inside the kernel, then power GX.
 + *
@@ -59,7 +59,7 @@ index 0000000..10075b9
 + * ADDRESS SPACES, the one thing this port must get right
 + *
 + * The shim ran with the MMU off, so every address it wrote was physical.
-+ * The kernel runs virtual.  Three address spaces are in play:
++ * The kernel runs virtual.  Four address spaces are in play:
 + *
 + *   - CPU virtual:  gbuf (this driver's kernel VA).  CPU reads/writes.
 + *   - CPU physical: gbuf_pa.  What the CPU's writes land at in RAM.
@@ -69,10 +69,15 @@ index 0000000..10075b9
 + *                   registers and the queue table were physical CPU
 + *                   addresses.
 + *
-+ * The SMMU context built here identity-maps a 2 MiB window around the
-+ * buffer block, so the values handed to the GMU are gbuf_pa-based -- the
-+ * shim's scheme unchanged.  All CPU access to the buffers goes through
-+ * gbuf; all GMU/SMMU descriptors carry gbuf_pa-based physical values.
++ * Measured on sweet (boot v7.1): kernel-managed RAM starts at 4 GiB, so a
++ * physical under-4-GiB allocation cannot exist (vm_page_find_contiguous
++ * bailed after 2 pages at max_pnum=262143 with 255k free pages).  The GMU
++ * therefore sees the buffers through an SMMU window at IOVA 0xC0000000 --
++ * the shim's MAP_BASE, which was an identity map only because the shim's
++ * buffer sat at the same physical address.  HFI_QTBL_ADDR is 32 bits, which
++ * fits an IOVA, not the physical address of any page this kernel owns.
++ * The SMMU context maps IOVA 0xC0000000..+2 MiB -> gbuf_pa (2 MiB aligned
++ * physical block); every GMU-visible value is built from GMU_IOVA_BASE.
 + *
 + * CACHES
 + *
@@ -160,12 +165,13 @@ index 0000000..10075b9
 +/* -------------------------------------------------------------------- */
 +
 +/*
-+ * The shim's layout, on one physically contiguous block under 4 GiB
-+ * (the GMU's HFI_QTBL_ADDR register is 32 bits).  The buffer half is the
++ * The shim's layout, on one physically contiguous block (measured boot
++ * v7.1: kernel RAM on sweet starts at 4 GiB, so "under 4 GiB" cannot be
++ * honored -- the allocation has no physical cap).  The buffer half is the
 + * queue table plus its three queue buffers plus the log; the tables half
-+ * is the SMMU's stage-1 root and one level-2 table.  The block is aligned
-+ * to its own 2 MiB-aligned SMMU block: the allocation is made 2 MiB in
-+ * size and 2 MiB aligned, so one level-2 block entry covers all of it.
++ * is the SMMU's stage-1 root and one level-2 table.  The block is slid to
++ * a 2 MiB physical boundary at allocation time (see gbuf_alloc), so one
++ * level-2 block entry covers all of it.
 + *
 + *     +0x0000  HFI queue table page (header + 3 queue headers)
 + *     +0x1000  command queue buffer     (1024 dwords)
@@ -192,7 +198,31 @@ index 0000000..10075b9
 +#define QHDR(q)		(GBUF_QTBL + 24u + (q) * 48u)
 +
 +static vm_offset_t gbuf;                /* kernel VA */
-+static uint32_t gbuf_pa;                /* physical, under 4 GiB, 2 MiB aligned */
++static uint64_t gbuf_pa;                /* physical, 2 MiB aligned */
++
++/* The GMU-visible window: the SMMU maps this IOVA -> gbuf_pa. */
++#define GMU_IOVA_BASE		0xc0000000ull
++
++/*
++ * The kernel_map VA layout rejected a 2 MiB-aligned kmem_alloc_contig with
++ * KERN_NO_SPACE (measured on the first v7 boot: physical 2 MiB was found,
++ * the VA hole was not).  So allocate 2 MiB + 32 KiB extra with only page
++ * alignment -- the shape sweet_ufs.c's working DMA allocation uses --
++ * and slide the buffer start up to the next 2 MiB physical boundary.  The
++ * kernel VA stays page-aligned, but the SMMU walks physical addresses
++ * (identity-mapped) and the GMU registers take physical values, so what
++ * matters everywhere downstream is gbuf_pa, and that is 2 MiB aligned by
++ * construction.  The unused tail of the over-allocation after GBUF_SIZE
++ * stays mapped and untouched.
++ *
++ * NO max_pnum cap: measured on boot v7.1, kernel RAM on sweet starts at
++ * 4 GiB (vm_page_find_contiguous bailed after 2 pages with max_pnum=
++ * 262143 and 255k free pages; the UFS DMA landed at 0x104524000).  The
++ * GMU sees this memory through the SMMU window at GMU_IOVA_BASE, so the
++ * physical address has no 32-bit constraint.
++ */
++#define GBUF_ALLOC_SIZE		(2 * 1024 * 1024 + 0x8000u)
++#define GBUF_ALIGN_STEP		(2 * 1024 * 1024u)
 +
 +static int
 +gbuf_alloc(void)
@@ -201,27 +231,34 @@ index 0000000..10075b9
 +
 +	if (gbuf)
 +		return 0;
-+	/*
-+	 * 2 MiB size and alignment so that exactly one 2 MiB level-2 block
-+	 * entry covers the whole buffer area regardless of where in the
-+	 * 2 MiB the allocation starts.  max_pnum keeps it under 4 GiB: the
-+	 * GMU's HFI_QTBL_ADDR register is 32 bits.
-+	 */
-+	kr = kmem_alloc_contig(kernel_map, &gbuf, 2 * 1024 * 1024,
-+	    2 * 1024 * 1024 - 1, (ppnum_t)(0xffffffffu >> PAGE_SHIFT), 0,
++	kr = kmem_alloc_contig(kernel_map, &gbuf, GBUF_ALLOC_SIZE,
++	    PAGE_MASK, 0, 0,
 +	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
 +	if (kr != KERN_SUCCESS) {
 +		printf("SWEET GMU: contiguous memory failed %d\n", kr);
 +		return ENOMEM;
 +	}
 +	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)gbuf);
-+	if (!pn || (ptoa_64(pn) + GBUF_SIZE - 1) >> 32) {
-+		printf("SWEET GMU: allocation above 4 GiB (pn=%u); unusable\n", pn);
++	if (!pn) {
++		printf("SWEET GMU: no physical page for buffers\n");
 +		return ENOMEM;
 +	}
-+	gbuf_pa = (uint32_t)ptoa_64(pn);
-+	printf("SWEET GMU: buffers at %#x (va %#lx), 2 MiB block\n",
-+	    gbuf_pa, (unsigned long)gbuf);
++	/*
++	 * Slide to the next 2 MiB physical boundary.  With 2 MiB of slack
++	 * above GBUF_SIZE any starting page number slides into a full
++	 * 2 MiB-aligned block without exceeding the allocation.
++	 */
++	uint64_t pa64 = ptoa_64(pn);
++	uint32_t off = (uint32_t)((-pa64) & (GBUF_ALIGN_STEP - 1u));
++	gbuf += off;
++	gbuf_pa = pa64 + off;
++	if (gbuf_pa & (GBUF_ALIGN_STEP - 1u)) {
++		printf("SWEET GMU: slid block %#llx unusable\n",
++		    (unsigned long long)gbuf_pa);
++		return ENOMEM;
++	}
++	printf("SWEET GMU: buffers at %#llx (va %#llx), 2 MiB aligned\n",
++	    (unsigned long long)gbuf_pa, (unsigned long long)gbuf);
 +	return 0;
 +}
 +
@@ -281,10 +318,19 @@ index 0000000..10075b9
 +static int
 +smmu_context_setup(void)
 +{
-+	uint32_t root = gbuf_pa + GBUF_L1;
-+	uint32_t l2 = gbuf_pa + GBUF_L2;
-+	uint32_t gig = (gbuf_pa >> 30) & 0x1ff;		/* root entry index */
-+	uint32_t blk = (gbuf_pa >> 21) & 0x1ff;		/* 2 MiB block index */
++	uint64_t root = gbuf_pa + GBUF_L1;
++	uint64_t l2 = gbuf_pa + GBUF_L2;
++	/*
++	 * The GMU's window: root[3] covers IOVA 0xC0000000..0xFFFFFFFF
++	 * ((0xc0000000 >> 30) & 0x1ff = 3), entry 0 of that level-2 table
++	 * covers 0xC0000000..0xC01FFFFF -- exactly GMU_IOVA_BASE..+2 MiB.
++	 * The 2 MiB block points at the physical buffer block.  The shim's
++	 * map was an identity map only because its buffer happened to sit
++	 * at the same physical address; the shape of the tables is the
++	 * shim's, only the block target differs.
++	 */
++	uint32_t gig = (GMU_IOVA_BASE >> 30) & 0x1ff;
++	uint32_t blk = (GMU_IOVA_BASE >> 21) & 0x1ff;
 +	uint64_t pte;
 +	uint32_t v;
 +
@@ -307,7 +353,7 @@ index 0000000..10075b9
 +		buf_wr32(GBUF_L2 + i * 8, 0);
 +		buf_wr32(GBUF_L2 + i * 8 + 4, 0);
 +	}
-+	pte = ((uint64_t)(gbuf_pa & ~0x1fffffu)) | SMMU_PTE_ATTR_CACHED |
++	pte = (gbuf_pa & ~0x1fffffull) | SMMU_PTE_ATTR_CACHED |
 +	    SMMU_PTE_SHARED | SMMU_PTE_ACCESSED | SMMU_PTE_NOT_GLOBAL |
 +	    SMMU_PTE_BLOCK;
 +	buf_wr32(GBUF_L2 + blk * 8, (uint32_t)pte);
@@ -332,9 +378,9 @@ index 0000000..10075b9
 +	smmu_wr(SMMU_CB(GMU_CTX) + SMMU_CB_TCR2, SMMU_TCR2);
 +	smmu_wr(SMMU_CB(GMU_CTX) + SMMU_CB_TCR, SMMU_TCR);
 +
-+	/* TTBR0: the root table.  TTBR1 stays zero because EPD1 = 1. */
-+	smmu_wr(SMMU_CB(GMU_CTX) + SMMU_CB_TTBR0, root);
-+	smmu_wr(SMMU_CB(GMU_CTX) + SMMU_CB_TTBR0 + 4, 0);
++	/* TTBR0: the root table (full 64 bits: the tables live above 4 GiB). */
++	smmu_wr(SMMU_CB(GMU_CTX) + SMMU_CB_TTBR0, (uint32_t)root);
++	smmu_wr(SMMU_CB(GMU_CTX) + SMMU_CB_TTBR0 + 4, (uint32_t)(root >> 32));
 +
 +	/* MAIRs, stage-1 only. */
 +	smmu_wr(SMMU_CB(GMU_CTX) + SMMU_CB_MAIR0, SMMU_MAIR0);
@@ -360,8 +406,9 @@ index 0000000..10075b9
 +	uint32_t s2cr = smmu_rd(SMMU_GR0_S2CR(GMU_CTX));
 +	uint32_t sctlr = smmu_rd(SMMU_CB(GMU_CTX) + SMMU_CB_SCTLR);
 +	uint32_t fsr = smmu_rd(SMMU_CB(GMU_CTX) + SMMU_CB_FSR);
-+	printf("SWEET GMU: SMR %#x S2CR %#x SCTLR %#x TTBR0 %#x FSR %#x\n",
-+	    v, s2cr, sctlr, smmu_rd(SMMU_CB(GMU_CTX) + SMMU_CB_TTBR0), fsr);
++	uint32_t id2 = smmu_rd(SMMU_GR0_ID2);
++	printf("SWEET GMU: SMR %#x S2CR %#x SCTLR %#x TTBR0 %08x%08x FSR %#x ID2 %#x\n",
++	    v, s2cr, sctlr, (uint32_t)(root >> 32), (uint32_t)root, fsr, id2);
 +
 +	if (v != (SMMU_SM_VALID | GMU_STREAM) ||
 +	    (s2cr & SMMU_S2CR_TYPE_MASK) != SMMU_S2CR_TRANSLATE) {
@@ -462,7 +509,7 @@ index 0000000..10075b9
 +		for (uint32_t i = 0; i < GMU_QUEUE_BUF_DWORDS; i++)
 +			buf_wr32(data + i * 4, 0);
 +		buf_wr32(h + QHDR_STATUS * 4, 1);		/* running */
-+		buf_wr32(h + QHDR_IOVA * 4, gbuf_pa + data);	/* physical */
++		buf_wr32(h + QHDR_IOVA * 4, (uint32_t)(GMU_IOVA_BASE + data));
 +		buf_wr32(h + QHDR_TYPE * 4, HFI_QTYPE(qid[q]));
 +		buf_wr32(h + QHDR_SIZE_DWORDS * 4, GMU_QUEUE_BUF_DWORDS);
 +		buf_wr32(h + QHDR_MSG_SIZE * 4, 0);
@@ -488,11 +535,12 @@ index 0000000..10075b9
 +		buf_wr32(GBUF_LOG + i, 0);
 +	gbuf_clean(GBUF_LOG, 0x1000);
 +
-+	printf("SWEET GMU: qtbl at %#x, q0 type %#x iova %#x\n",
-+	    gbuf_pa + GBUF_QTBL, buf_rd32(QHDR(0) + 8), buf_rd32(QHDR(0) + 4));
++	printf("SWEET GMU: qtbl iova %#x, q0 type %#x rd_idx %#x\n",
++	    (uint32_t)(GMU_IOVA_BASE + GBUF_QTBL), buf_rd32(QHDR(0) + 8),
++	    buf_rd32(QHDR(0) + 4));
 +
-+	/* Hand the addresses to the firmware. */
-+	gmu_wr(GMU_HFI_QTBL_ADDR, gbuf_pa + GBUF_QTBL);
++	/* Hand the addresses to the firmware, in the GMU's IOVA window. */
++	gmu_wr(GMU_HFI_QTBL_ADDR, (uint32_t)(GMU_IOVA_BASE + GBUF_QTBL));
 +	gmu_wr(GMU_HFI_QTBL_INFO, 1);
 +	/* HFI_SFR_ADDR: the GPU chip id, mainline's massage of 0x06010800. */
 +	gmu_wr(GMU_HFI_SFR_ADDR,
@@ -500,7 +548,7 @@ index 0000000..10075b9
 +	    ((0x06010800u << 4) & 0xf000u) |
 +	    ((0x06010800u << 8) & 0x0f00u));
 +	/* The log buffer and the CP message page: one page each, both ours. */
-+	gmu_wr(GMU_PWR_COL_CP_MSG, gbuf_pa + GBUF_LOG);
++	gmu_wr(GMU_PWR_COL_CP_MSG, (uint32_t)(GMU_IOVA_BASE + GBUF_LOG));
 +	/* AHB fence range, as mainline sets it for a6xx before the start. */
 +	gmu_wr(GMU_AHB_FENCE_RANGE_0, (1u << 31) | (0xau << 18) | 0xa0);
 +	/* TCM retention on; a stale result would look like success. */
@@ -798,7 +846,7 @@ index 0000000..10075b9
 +	/* ---- INIT (id 0): debug buffer, its size, boot state (cold) ---- */
 +	q[0] = HFI_HEADER(seq, 0, 5, HFI_MSG_INIT);
 +	q[1] = 0;				/* seg_id */
-+	q[2] = gbuf_pa + GBUF_LOG;		/* debug buffer */
++	q[2] = (uint32_t)(GMU_IOVA_BASE + GBUF_LOG);	/* debug buffer */
 +	q[3] = 0x1000;				/* its size */
 +	q[4] = 0;				/* boot_state: cold */
 +	gbuf_clean(QDATA(0), 0x1000);
@@ -2833,10 +2881,10 @@ index 0000000..8ae8f59
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/sweet_gpu_regs.h b/bsd/dev/sweet_gpu_regs.h
 new file mode 100644
-index 0000000..e90b89b
+index 0000000..512dbbe
 --- /dev/null
 +++ b/bsd/dev/sweet_gpu_regs.h
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,170 @@
 +/*
 + * sweet_gpu_regs.h - every GPU register offset this project has measured.
 + *
@@ -2957,6 +3005,7 @@ index 0000000..e90b89b
 + */
 +#define SMMU_GR0_SMR(n)		(0x800 + 4 * (n))
 +#define SMMU_GR0_S2CR(n)	(0xc00 + 4 * (n))
++#define SMMU_GR0_ID2		0x28		/* IAS/OAS/PTF sizes */
 +#define SMMU_GR1_CBAR(n)	(0x1000 + 4 * (n))
 +#define SMMU_GR1_CBA2R(n)	(0x1800 + 4 * (n))
 +#define SMMU_CB(n)		(0x8000UL + 0x1000UL * (n))
